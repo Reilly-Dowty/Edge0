@@ -232,7 +232,10 @@ struct LatentTab {
     int64_t lat_H = 0, lat_ELL = 0, lat_I = 0;
     int lat_G = 8, lat_E = 0;
     bool latent = false;
-    bool load(const strata::core::ModelGeometry& g, std::string& err) {
+    bool per_dev = false;   // edge0-multigpu: the pairs went to every stage's card (the device slots are set)
+    bool load(const strata::core::ModelGeometry& g, std::string& err,
+              const std::vector<std::array<int64_t, 3>>* ranges = nullptr) {
+        if (per_dev) return true;
         if (d != nullptr) { strata::core::latent_shared_d() = d; strata::core::latent_shared_u() = u; return true; }
         const auto& lay0 = strata::kernels::cpu::expert_layout();
         if (!(lay0.native && !lay0.fmt.empty() && lay0.fmt[0].n_embd != (int64_t) g.n_embd)) return true;
@@ -256,6 +259,42 @@ struct LatentTab {
             const size_t got = std::fread(labels.data(), sizeof(int32_t), labels.size(), lf);
             std::fclose(lf);
             if (got != labels.size()) { err = "latent dense: " + lp + " is too small"; return false; }
+        }
+        if (ranges != nullptr && !ranges->empty()) {   // edge0-multigpu: each card gets only its stage's layers
+            int prev = 0;
+            (void) cudaGetDevice(&prev);
+            for (const auto& r : *ranges) {
+                const int dev = (int) r[0];
+                const int64_t lb = r[1], le = r[2], nl = le - lb;
+                if (nl <= 0) continue;
+                if (cudaSetDevice(dev) != cudaSuccess) { err = "latent multigpu: cudaSetDevice(" + std::to_string(dev) + ")"; return false; }
+                uint8_t *dd = nullptr, *uu = nullptr;
+                if (cudaMalloc((void**) &dd, (size_t) nl * dense.d_bytes()) != cudaSuccess ||
+                    cudaMalloc((void**) &uu, (size_t) nl * dense.u_bytes()) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    err = "latent multigpu: CUDA" + std::to_string(dev) + " could not hold its D/U layers [" +
+                          std::to_string(lb) + ", " + std::to_string(le) + ")";
+                    (void) cudaSetDevice(prev);
+                    return false;
+                }
+                for (int64_t l = lb; l < le; ++l)
+                    if (cudaMemcpy(dd + (size_t) (l - lb) * dense.d_bytes(), dense.d(l), dense.d_bytes(), cudaMemcpyHostToDevice) != cudaSuccess ||
+                        cudaMemcpy(uu + (size_t) (l - lb) * dense.u_bytes(), dense.u(l), dense.u_bytes(), cudaMemcpyHostToDevice) != cudaSuccess) {
+                        err = "latent multigpu: the D/U upload failed on CUDA" + std::to_string(dev) + " at layer " + std::to_string(l);
+                        (void) cudaSetDevice(prev);
+                        return false;
+                    }
+                // offset base: ptr + l * bytes lands in this card's copy for every l in [lb, le)
+                strata::core::latent_shared_d() = dd - (ptrdiff_t) lb * (ptrdiff_t) dense.d_bytes();
+                strata::core::latent_shared_u() = uu - (ptrdiff_t) lb * (ptrdiff_t) dense.u_bytes();
+                std::fprintf(stderr, "strata: latent multigpu: CUDA%d holds D/U of layers [%lld, %lld) (%.0f MiB)\n", dev,
+                             (long long) lb, (long long) le, (double) nl * (double) (dense.d_bytes() + dense.u_bytes()) / 1048576.0);
+            }
+            (void) cudaSetDevice(prev);
+            per_dev = true;
+            d = strata::core::latent_shared_d();   // the current card's (non-null marks "loaded")
+            u = strata::core::latent_shared_u();
+            return true;
         }
         const uint64_t db = (uint64_t) g.n_layers * dense.d_bytes(), ub = (uint64_t) g.n_layers * dense.u_bytes();
         if (cudaMalloc((void**) &d, db) != cudaSuccess || cudaMalloc((void**) &u, ub) != cudaSuccess) {
@@ -6068,6 +6107,13 @@ int main(int argc, char** argv) {
                      last ? " and the head" : "", (double) fb / 1073741824.0);
     }
 
+    if (!stages.empty()) {   // edge0-multigpu: the latent D/U pair on every stage's card (a no-op for other packs)
+        std::vector<std::array<int64_t, 3>> rr;
+        rr.push_back({0, 0, (int64_t) split_at[0]});
+        for (const auto& sp : stages) rr.push_back({(int64_t) sp->dev, (int64_t) sp->lb, (int64_t) sp->le});
+        std::string le;
+        if (!lat_tab.load(g, le, &rr)) { std::fprintf(stderr, "strata generate: %s\n", le.c_str()); return 1; }
+    }
     // --batch: every stage carves o.batch more sessions like its own (same layer range and context), one per
     // slot of the batch windows.  Before the expert cache is sized, so `--expert-cache auto` leaves them room.
     // Recommend, never force: a count the engine cannot run is said and adjusted (or batching left off) - the
